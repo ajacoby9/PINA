@@ -1,6 +1,5 @@
 """Module for the B-Spline model class."""
 import torch
-from ...utils import check_consistency
 
 class B_Spline:
     """
@@ -9,9 +8,10 @@ class B_Spline:
     """
     def __init__(self, k: int, grid: torch.Tensor, grid_extension: bool = True, x: torch.Tensor = None):
         """
-        Inilialize the B-Spline class.
+        Initialize the B-Spline class.
         """
         self.k = k
+        self.k_extend = k  # For grid extension
         self.grid = grid
         self.grid_extension = grid_extension
         self.x = x
@@ -20,6 +20,8 @@ class B_Spline:
         """
         Create the basis functions for the B-Spline.
         """
+        x = x.unsqueeze(dim=2)
+        grid = grid.unsqueeze(dim=0)
         if k == 0:
             return (x >= grid[:, :, :-1]) * (x < grid[:, :, 1:])
         else:
@@ -27,7 +29,7 @@ class B_Spline:
             return (x - grid[:, :, :-(k + 1)]) / (grid[:, :, k:-1] - grid[:, :, :-(k + 1)]) * basis_function[:, :, :-1] + (
                     grid[:, :, k + 1:] - x) / (grid[:, :, k + 1:] - grid[:, :, 1:(-k)]) * basis_function[:, :, 1:]
 
-    def compute_coefficients(self, x: torch.Tensor, k: int, grid: torch.Tensor, coefficients: torch.Tensor):
+    def compute_coefficients_for_b_spline(self, x: torch.Tensor, k: int, grid: torch.Tensor, coefficients: torch.Tensor):
         """
         use the basis function to compute the coefficients
         """
@@ -35,9 +37,36 @@ class B_Spline:
         y_eval = torch.einsum('ijk,jlk->ijl', b_splines, coefficients.to(b_splines.device))
         return y_eval
     
+    def compute_coefficients_from_b_spline(self, x_eval, y_eval, grid, k):
+        batch = x_eval.shape[0]
+        in_dim = x_eval.shape[1]
+        out_dim = y_eval.shape[2]
+        n_coef = grid.shape[1] - k - 1
+        mat = self.create_basis_functions(k, grid, x_eval)
+        mat = mat.permute(1,0,2)[:,None,:,:].expand(in_dim, out_dim, batch, n_coef)
+        y_eval = y_eval.permute(1,2,0).unsqueeze(dim=3)
+        device = mat.device
+        try:
+            coefficients = torch.linalg.lstsq(mat, y_eval).solution[:,:,:,0]
+        except:
+            print('lstsq failed')
+        return coefficients
 
     def grid_extension(self, grid):
-        pass
+        """
+        Extend the grid by the order of the B-Spline.
+        """
+        h = (grid[:, [-1]] - grid[:, [0]]) / (grid.shape[1] - 1)
+        for i in range(self.k_extend):
+            grid = torch.cat([grid[:, [0]] - h, grid], dim=1)
+            grid = torch.cat([grid, grid[:, [-1]] + h], dim=1)
+
+        return grid
+    
+    def __call__(self, x):
+        """Make B_Spline callable - placeholder for now"""
+        # This needs proper implementation with coefficients
+        return x  # Temporary placeholder
 
 """
 Plan:
