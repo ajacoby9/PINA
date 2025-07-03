@@ -94,6 +94,26 @@ class KAN_Network(torch.nn.Module):
         """Get total number of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
+    
+    def update_grid_from_samples(self, x: torch.Tensor, mode: str = 'sample'):
+        """
+        Update grid for all layers based on input samples.
+        This adapts the grid points to better fit the data distribution.
+        
+        Args:
+            x: Input samples, shape (batch_size, input_dimensions)
+            mode: 'sample' or 'grid' - determines sampling strategy
+        """
+        current = x
+        
+        for i, layer in enumerate(self.kan_layers):
+            # Update this layer's grid based on current activations
+            layer.update_grid_from_samples(current, mode=mode)
+            
+            # Get activations for next layer (if not the last layer)
+            if i < len(self.kan_layers) - 1:
+                with torch.no_grad():
+                    current = layer(current)
     def update_grid_resolution(self, new_num: int):
         """
         Update the grid resolution for all layers.
@@ -150,3 +170,18 @@ class KAN_Network(torch.nn.Module):
             }
             
         return stats
+    
+    
+    def get_network_grid_statistics(self):
+        """
+        Get grid statistics for all layers in the network.
+        
+        Returns:
+            Dictionary with grid statistics for each layer
+        """
+        stats = {}
+        for i, layer in enumerate(self.kan_layers):
+            stats[f'layer_{i}'] = layer.get_grid_statistics()
+        return stats
+
+  

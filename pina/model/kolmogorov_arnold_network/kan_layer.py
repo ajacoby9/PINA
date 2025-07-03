@@ -80,6 +80,124 @@ class KAN_layer(torch.nn.Module):
         
         return output
 
+    def update_grid_from_samples(self, x: torch.Tensor, mode: str = 'sample'):
+        """
+        Update grid from input samples to better fit data distribution.
+        
+        Args:
+            x: Input samples, shape (batch_size, input_dimensions)
+            mode: 'sample' or 'grid' - determines sampling strategy
+            
+        Returns:
+            None
+        
+        Example:
+            >>> layer = KAN_layer(k=3, input_dimensions=2, output_dimensions=1, inner_nodes=0, num=5)
+            >>> x = torch.randn(100, 2)  # 100 samples, 2 input dimensions
+            >>> layer.update_grid_from_samples(x)
+        """
+        with torch.no_grad():
+            batch_size = x.shape[0]
+            
+            # Sort input samples along batch dimension for each input dimension
+            x_sorted = torch.sort(x, dim=0)[0]  # (batch_size, input_dimensions)
+            
+            # Evaluate current spline at sorted positions
+            y_eval = self.b_spline.compute_coefficients_for_b_spline(
+                x=x_sorted,
+                k=self.k,
+                grid=self.grid,
+                coefficients=self.b_spline_basis_coefficents
+            )
+            
+            # Calculate number of intervals (excluding extended grid points)
+            if self.grid_extension:
+                # Account for extended grid points (k points on each side)
+                num_interval = self.grid.shape[1] - 1 - 2*self.k
+            else:
+                num_interval = self.grid.shape[1] - 1
+            
+            num_interval = max(1, num_interval)  # Ensure at least 1 interval
+            
+            def get_grid_adaptive(num_intervals: int):
+                """Create adaptive grid based on sample quantiles"""
+                # Calculate quantile positions for grid points
+                indices = [int(batch_size * i / num_intervals) for i in range(num_intervals)]
+                indices.append(batch_size - 1)  # Last sample
+                
+                # Get adaptive grid points from sorted samples
+                grid_adaptive = x_sorted[indices, :].transpose(0, 1)  # (input_dimensions, num_intervals+1)
+                
+                # Create uniform grid as baseline
+                margin = 0.01  # Small margin for numerical stability
+                grid_min = grid_adaptive[:, [0]] - margin
+                grid_max = grid_adaptive[:, [-1]] + margin
+                h = (grid_max - grid_min) / num_intervals
+                
+                grid_uniform = grid_min + h * torch.arange(
+                    num_intervals + 1, device=x.device, dtype=x.dtype
+                )[None, :]
+                
+                # Blend adaptive and uniform grids
+                grid_blended = (self.grid_eps * grid_uniform + 
+                              (1 - self.grid_eps) * grid_adaptive)
+                
+                return grid_blended
+            
+            # Create new grid
+            new_grid = get_grid_adaptive(num_interval)
+            
+            # If mode is 'grid', use denser sampling for coefficient fitting
+            if mode == 'grid':
+                sample_grid = get_grid_adaptive(2 * num_interval)
+                x_eval = sample_grid.transpose(0, 1)  # (batch_size, input_dimensions)
+                # Re-evaluate at denser grid
+                y_eval = self.b_spline.compute_coefficients_for_b_spline(
+                    x=x_eval,
+                    k=self.k,
+                    grid=self.grid,
+                    coefficients=self.b_spline_basis_coefficents
+                )
+                x_sorted = x_eval
+            
+            # Apply grid extension if needed
+            if self.grid_extension:
+                new_grid = self.b_spline.grid_extension(new_grid)
+            
+            # Update grid
+            self.grid = new_grid
+            
+            # Recompute B-spline coefficients to maintain continuity
+            try:
+                new_coefficients = self.b_spline.compute_coefficients_from_b_spline(
+                    x_eval=x_sorted,
+                    y_eval=y_eval,
+                    grid=self.grid,
+                    k=self.k
+                )
+                
+                # Update coefficients with proper shape handling
+                if new_coefficients.shape == self.b_spline_basis_coefficents.shape:
+                    self.b_spline_basis_coefficents.data = new_coefficients
+                else:
+                    # Handle size mismatch by creating new parameter
+                    self.b_spline_basis_coefficents = torch.nn.Parameter(new_coefficients)
+                    
+            except Exception as e:
+                # If coefficient fitting fails, keep old coefficients
+                print(f"Warning: Failed to update coefficients during grid refinement: {e}")
+                # Optionally, we could reset coefficients to small random values
+                pass
+
+    def get_grid_statistics(self):
+        """Get statistics about the current grid for debugging/analysis"""
+        return {
+            'grid_shape': self.grid.shape,
+            'grid_min': self.grid.min().item(),
+            'grid_max': self.grid.max().item(),
+            'grid_range': (self.grid.max() - self.grid.min()).mean().item(),
+            'num_intervals': self.grid.shape[1] - 1 - (2*self.k if self.grid_extension else 0)
+        }
 
 ''''
 How to implement a KAN layer:
