@@ -120,18 +120,10 @@ class KAN_Network(torch.nn.Module):
         current = x
         
         for i, layer in enumerate(self.kan_layers):
-            # The input to the update function should be (batch_size, in_dim)
-            if current.ndim > 2:
-                # Reshape from (batch, in, out) to (batch, in*out) or handle appropriately
-                # For now, let's assume we need to squeeze the last dimension if it's 1
-                if current.shape[-1] == 1:
-                    current = current.squeeze(-1)
-            
             layer.update_grid_from_samples(current, mode=mode)
             
             if i < len(self.kan_layers) - 1:
                 with torch.no_grad():
-                    # The forward pass of the layer will produce the input for the next one
                     current = layer(current)
                     
     def update_grid_resolution(self, new_num: int):

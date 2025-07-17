@@ -73,7 +73,7 @@ class KAN_layer(torch.nn.Module):
         """
         base = self.base_function(x)  # (batch, input_dimensions)
         
-        basis = self.spline._create_basis(x, self.spline.knots, self.spline.k)
+        basis = self.spline.basis(x, self.spline.k, self.spline.knots)
         spline_out_per_input = torch.einsum("bil,iol->bio", basis, self.spline.control_points)
 
         base_term = self.scale_base[None, :, :] * base[:, :, None]
@@ -89,38 +89,63 @@ class KAN_layer(torch.nn.Module):
         """
         Update grid from input samples to better fit data distribution.
         """
-        print("\n--- KAN_layer.update_grid_from_samples ---")
         with torch.no_grad():
             batch_size = x.shape[0]
-            print(f"Input x shape: {x.shape}, range: [{x.min():.4f}, {x.max():.4f}]")
             
-            x_sorted = torch.sort(x, dim=0)[0]
-            indices = torch.linspace(0, batch_size - 1, self.num + 1, dtype=torch.long, device=x.device)
-            grid_adaptive = x_sorted[indices].transpose(0, 1)
-
-            grid_uniform = torch.linspace(self.grid_range[0], self.grid_range[1], self.num + 1, device=x.device)
-            grid_uniform = grid_uniform.unsqueeze(0).expand(self.input_dimensions, -1)
+            x_sorted = torch.sort(x, dim=0)[0]  # (batch_size, input_dimensions)
             
-            new_grid = self.grid_eps * grid_uniform + (1 - self.grid_eps) * grid_adaptive
+            basis = self.spline.basis(x_sorted, self.spline.k, self.spline.knots)
+            y_eval = torch.einsum("bil,iol->bio", basis, self.spline.control_points)
 
+            num_interval = self.num
+            
+            def get_grid_adaptive(num_intervals: int):
+                """Create adaptive grid based on sample quantiles"""
+                indices = [int(batch_size * i / num_intervals) for i in range(num_intervals)]
+                indices.append(batch_size - 1) 
+                
+                grid_adaptive = x_sorted[indices, :].transpose(0, 1)  # (input_dimensions, num_intervals+1)
+                
+                margin = 0.01  # Small margin for numerical stability
+                grid_min = grid_adaptive[:, [0]] - margin
+                grid_max = grid_adaptive[:, [-1]] + margin
+                h = (grid_max - grid_min) / num_intervals
+                
+                grid_uniform = grid_min + h * torch.arange(
+                    num_intervals + 1, device=x.device, dtype=x.dtype
+                )[None, :]
+                
+                grid_blended = (self.grid_eps * grid_uniform + 
+                              (1 - self.grid_eps) * grid_adaptive)
+                
+                return grid_blended
+            
+            new_grid = get_grid_adaptive(num_interval)
+            
+            if mode == 'grid':
+                sample_grid = get_grid_adaptive(2 * num_interval)
+                x_eval = sample_grid.transpose(0, 1)  # (batch_size, input_dimensions)
+                # Re-evaluate at denser grid
+                basis = self.spline.basis(x_eval, self.spline.k, self.spline.knots)
+                y_eval = torch.einsum("bil,iol->bio", basis, self.spline.control_points)
+
+                x_sorted = x_eval
+            
             if self.grid_extension:
                 h = (new_grid[:, [-1]] - new_grid[:, [0]]) / (new_grid.shape[1] - 1)
                 for i in range(self.k):
                     new_grid = torch.cat([new_grid[:, [0]] - h, new_grid], dim=1)
                     new_grid = torch.cat([new_grid, new_grid[:, [-1]] + h], dim=1)
             
-            # Evaluate the OLD spline on the SORTED INPUT SAMPLES
-            old_basis = self.spline._create_basis(x_sorted, self.spline.knots, self.spline.k)
-            y_eval = torch.einsum("bil,iol->bio", old_basis, self.spline.control_points)
-            print(f"y_eval for refitting shape: {y_eval.shape}, range: [{y_eval.min():.4f}, {y_eval.max():.4f}]")
+            self.spline.knots = new_grid
             
-            print("Calling spline.compute_control_points...")
             try:
-                # Refit the NEW spline to the (x_sorted, y_eval) pairs
-                self.spline.compute_control_points(x_sorted, y_eval, new_grid)
+                self.spline.compute_control_points(x_sorted, y_eval)
+                    
             except Exception as e:
-                print(f"ERROR: Failed to update coefficients during grid refinement: {e}")
-        print("--- End KAN_layer.update_grid_from_samples ---\n")
+                # If coefficient fitting fails, keep old coefficients
+                print(f"Warning: Failed to update coefficients during grid refinement: {e}")
+                pass
 
     def update_grid_resolution(self, new_num: int):
         """
@@ -136,7 +161,7 @@ class KAN_layer(torch.nn.Module):
             )
             x_eval = x_eval.unsqueeze(1).expand(-1, self.input_dimensions)
 
-            basis = self.spline._create_basis(x_eval, self.spline.knots, self.spline.k)
+            basis = self.spline.basis(x_eval, self.spline.k, self.spline.knots)
             y_eval = torch.einsum("bil,iol->bio", basis, self.spline.control_points)
 
             # Update num and create a new grid
@@ -156,7 +181,8 @@ class KAN_layer(torch.nn.Module):
                     new_grid = torch.cat([new_grid, new_grid[:, [-1]] + h], dim=1)
             
             # Update spline with the new grid and re-compute control points
-            self.spline.compute_control_points(x_eval, y_eval, new_grid)
+            self.spline.knots = new_grid
+            self.spline.compute_control_points(x_eval, y_eval)
 
     def get_grid_statistics(self):
         """Get statistics about the current grid for debugging/analysis"""

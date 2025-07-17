@@ -69,73 +69,77 @@ class Spline(torch.nn.Module):
         if self.knots.ndim > 2:
             raise ValueError("Knot vector must be one or two-dimensional.")
 
-    def _create_basis(self, x, k, knots):
+    def basis(self, x, k, knots):
         """
-        Compute the B-spline basis functions using recursion, aligned with pykan's B_batch.
+        Compute the basis functions for the spline using an iterative approach.
+        This is a vectorized implementation based on the Cox-de Boor recursion.
+
+        :param torch.Tensor x: The points to be evaluated.
+        :param int k: The spline degree.
+        :param torch.Tensor knots: The tensor of knots.
+        :return: The basis functions evaluated at x
+        :rtype: torch.Tensor
         """
-        if k == 0:
-            # Base case: B-spline of order 0 is a step function
-            value = (x[..., None] >= knots[..., :-1]) & (x[..., None] < knots[..., 1:])
-            return value.to(x.dtype)
+        # unsqueeze for broadcasting
+        if x.ndim == 1:
+            x = x.unsqueeze(1)  # (batch_size, 1)
+        x = x.unsqueeze(2)  # (batch_size, in_dim, 1)
 
-        # Recursive step
-        # First term
-        basis_k_minus_1_first = self._create_basis(x, k - 1, knots)
-        
-        denom1 = knots[..., k:-1] - knots[..., :-(k+1)]
-        denom1 = torch.where(torch.abs(denom1) < 1e-8, torch.ones_like(denom1), denom1)
-        
-        numer1 = x[..., None] - knots[..., :-(k+1)]
-        term1 = (numer1 / denom1) * basis_k_minus_1_first
+        if knots.ndim == 1:
+            knots = knots.unsqueeze(0)  # (1, n_knots)
+        knots = knots.unsqueeze(0)  # (1, in_dim, n_knots)
 
-        # Second term
-        basis_k_minus_1_second = self._create_basis(x, k - 1, torch.roll(knots, shifts=-1, dims=-1))
-        
-        denom2 = knots[..., k+1:] - knots[..., 1:-k]
-        denom2 = torch.where(torch.abs(denom2) < 1e-8, torch.ones_like(denom2), denom2)
+        # Base case: k=0
+        basis = (x >= knots[..., :-1]) & (x < knots[..., 1:])
+        basis = basis.to(x.dtype)
+        basis[..., -1] = (x.squeeze(-1) >= knots[..., -2]) & (
+            x.squeeze(-1) <= knots[..., -1]
+        )
 
-        numer2 = knots[..., k+1:] - x[..., None]
-        term2 = (numer2 / denom2) * basis_k_minus_1_second
+        # Iterative step
+        for i in range(1, k + 1):
+            # First term of the recursion
+            denom1 = knots[..., i:-1] - knots[..., : -(i + 1)]
+            denom1 = torch.where(
+                torch.abs(denom1) < 1e-8, torch.ones_like(denom1), denom1
+            )
+            numer1 = x - knots[..., : -(i + 1)]
+            term1 = (numer1 / denom1) * basis[..., :-1]
 
-        return term1 + term2
+            denom2 = knots[..., i + 1 :] - knots[..., 1:-i]
+            denom2 = torch.where(
+                torch.abs(denom2) < 1e-8, torch.ones_like(denom2), denom2
+            )
+            numer2 = knots[..., i + 1 :] - x
+            term2 = (numer2 / denom2) * basis[..., 1:]
 
+            basis = term1 + term2
 
-    def compute_control_points(self, x_eval, y_eval, new_knots):
+        return basis
+
+    def compute_control_points(self, x_eval, y_eval):
         """
-        Compute control points from given evaluations using least squares with regularization.
+        Compute control points from given evaluations using least squares.
+        This method fits the control points to match the target y_eval values.
         """
-        print("--- spline.compute_control_points ---")
-        print(f"x_eval shape: {x_eval.shape}, range: [{x_eval.min():.4f}, {x_eval.max():.4f}]")
-        print(f"y_eval shape: {y_eval.shape}, range: [{y_eval.min():.4f}, {y_eval.max():.4f}]")
-        print(f"new_knots shape: {new_knots.shape}, range: [{new_knots.min():.4f}, {new_knots.max():.4f}]")
-        
-        A = self._create_basis(x_eval, self.k, new_knots)
-        print(f"Basis matrix A shape: {A.shape}")
-        
+        # (batch, in_dim)
+        A = self.basis(x_eval, self.k, self.knots)
+        # (batch, in_dim, n_basis)
+
         in_dim = A.shape[1]
         out_dim = y_eval.shape[2]
         n_basis = A.shape[2]
         c = torch.zeros(in_dim, out_dim, n_basis).to(A.device)
 
         for i in range(in_dim):
+            # A_i is (batch, n_basis)
+            # y_i is (batch, out_dim)
             A_i = A[:, i, :]
             y_i = y_eval[:, i, :]
-            
-            # Regularized least squares
-            A_t_A = A_i.T @ A_i
-            A_t_y = A_i.T @ y_i
-            ridge = 1e-6 * torch.eye(A_t_A.shape[0], device=A_i.device)
-            
-            try:
-                c_i = torch.linalg.solve(A_t_A + ridge, A_t_y).T
-                c[i, :, :] = c_i
-            except torch.linalg.LinAlgError as e:
-                print(f"ERROR: torch.linalg.solve failed for input_dim {i}: {e}")
-        
-        print(f"Computed control points shape: {c.shape}, range: [{c.min():.4f}, {c.max():.4f}]")
-        self.knots = new_knots
+            c_i = torch.linalg.lstsq(A_i, y_i).solution  # (n_basis, out_dim)
+            c[i, :, :] = c_i.T  # (out_dim, n_basis)
+
         self.control_points = torch.nn.Parameter(c)
-        print("--- End spline.compute_control_points ---\n")
 
     @property
     def control_points(self):
@@ -215,6 +219,7 @@ class Spline(torch.nn.Module):
             raise ValueError("Invalid value for knots")
 
         self._knots = value
+
     def forward(self, x):
         """
         Forward pass for the :class:`Spline` model.
@@ -229,7 +234,7 @@ class Spline(torch.nn.Module):
 
         # Create the basis functions
         # B will have shape (batch, in_dim, n_basis)
-        B = self._create_basis(x, k, t)
+        B = self.basis(x, k, t)
 
         # KAN case where control points are (in_dim, out_dim, n_basis)
         if c.ndim == 3:
@@ -245,4 +250,3 @@ class Spline(torch.nn.Module):
                 y = torch.einsum("bi,ij->bj", B, c)
 
         return y
-
