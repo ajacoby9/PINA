@@ -18,15 +18,20 @@ class KAN_Network(torch.nn.Module):
         self, 
         layer_sizes: List[int],
         k: int = 3,
-        num: int = 5,
+        num: int = 3,
         grid_eps: float = 0.02,
         grid_range: List[float] = [-1, 1],
         grid_extension: bool = True,
-        noise_scale: float = 0.5,
+        noise_scale: float = 0.1,
         base_function = torch.nn.SiLU(),
         scale_base_mu: float = 0.0,
         scale_base_sigma: float = 1.0,
-        scale_sp: float = 1.0
+        scale_sp: float = 1.0,
+        inner_nodes: int = 5,
+        sparse_init: bool = False,
+        sp_trainable: bool = True,
+        sb_trainable: bool = True,
+        save_act: bool = True
     ):
         """
         Initialize the KAN network.
@@ -51,6 +56,7 @@ class KAN_Network(torch.nn.Module):
         
         self.layer_sizes = layer_sizes
         self.num_layers = len(layer_sizes) - 1
+        self.save_act = save_act
         
         # Create KAN layers
         self.kan_layers = nn.ModuleList()
@@ -60,7 +66,6 @@ class KAN_Network(torch.nn.Module):
                 k=k,
                 input_dimensions=layer_sizes[i],
                 output_dimensions=layer_sizes[i+1],
-                inner_nodes=0,  # Not used in current implementation
                 num=num,
                 grid_eps=grid_eps,
                 grid_range=grid_range,
@@ -69,7 +74,11 @@ class KAN_Network(torch.nn.Module):
                 base_function=base_function,
                 scale_base_mu=scale_base_mu,
                 scale_base_sigma=scale_base_sigma,
-                scale_sp=scale_sp
+                scale_sp=scale_sp,
+                inner_nodes=inner_nodes,
+                sparse_init=sparse_init,
+                sp_trainable=sp_trainable,
+                sb_trainable=sb_trainable
             )
             self.kan_layers.append(layer)
     
@@ -84,9 +93,13 @@ class KAN_Network(torch.nn.Module):
             Output tensor of shape (batch_size, output_dimensions)
         """
         current = x
-        
-        for layer in self.kan_layers:
+        self.acts = [current]
+
+        for i, layer in enumerate(self.kan_layers):
             current = layer(current)
+            
+            if self.save_act:
+                self.acts.append(current.detach())
             
         return current
     
@@ -107,13 +120,20 @@ class KAN_Network(torch.nn.Module):
         current = x
         
         for i, layer in enumerate(self.kan_layers):
-            # Update this layer's grid based on current activations
+            # The input to the update function should be (batch_size, in_dim)
+            if current.ndim > 2:
+                # Reshape from (batch, in, out) to (batch, in*out) or handle appropriately
+                # For now, let's assume we need to squeeze the last dimension if it's 1
+                if current.shape[-1] == 1:
+                    current = current.squeeze(-1)
+            
             layer.update_grid_from_samples(current, mode=mode)
             
-            # Get activations for next layer (if not the last layer)
             if i < len(self.kan_layers) - 1:
                 with torch.no_grad():
+                    # The forward pass of the layer will produce the input for the next one
                     current = layer(current)
+                    
     def update_grid_resolution(self, new_num: int):
         """
         Update the grid resolution for all layers.
@@ -123,12 +143,7 @@ class KAN_Network(torch.nn.Module):
             new_num: New number of grid points
         """
         for layer in self.kan_layers:
-            # This would require implementing grid refinement logic
-            # For now, this is a placeholder for future enhancement
-            layer.num = new_num
-            # TODO: Implement actual grid refinement
-
-        pass
+            layer.update_grid_resolution(new_num)
             
     def enable_sparsification(self, threshold: float = 1e-4):
         """
@@ -144,7 +159,7 @@ class KAN_Network(torch.nn.Module):
                 layer.scale_spline.data[torch.abs(layer.scale_spline.data) < threshold] = 0
                 
                 # Update mask
-                layer.mask = ((torch.abs(layer.scale_base) >= threshold) | 
+                layer.mask.data = ((torch.abs(layer.scale_base) >= threshold) | 
                              (torch.abs(layer.scale_spline) >= threshold)).float()
 
     def get_activation_statistics(self, x: torch.Tensor):

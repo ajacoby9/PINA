@@ -9,7 +9,7 @@ class Spline(torch.nn.Module):
     Spline model class.
     """
 
-    def __init__(self, order=4, knots=None, control_points=None) -> None:
+    def __init__(self, order=4, knots=None, control_points=None, grid_extension=True) -> None:
         """
         Initialization of the :class:`Spline` class.
 
@@ -33,6 +33,7 @@ class Spline(torch.nn.Module):
 
         self.order = order
         self.k = order - 1
+        self.grid_extension = grid_extension
 
         if knots is not None and control_points is not None:
             self.knots = knots
@@ -65,45 +66,76 @@ class Spline(torch.nn.Module):
         else:
             raise ValueError("Knots and control points cannot be both None.")
 
-        if self.knots.ndim != 1:
-            raise ValueError("Knot vector must be one-dimensional.")
+        if self.knots.ndim > 2:
+            raise ValueError("Knot vector must be one or two-dimensional.")
 
-    def basis(self, x, k, i, t):
+    def _create_basis(self, x, k, knots):
         """
-        Recursive method to compute the basis functions of the spline.
-
-        :param torch.Tensor x: The points to be evaluated.
-        :param int k: The spline degree.
-        :param int i: The index of the interval.
-        :param torch.Tensor t: The tensor of knots.
-        :return: The basis functions evaluated at x
-        :rtype: torch.Tensor
+        Compute the B-spline basis functions using recursion, aligned with pykan's B_batch.
         """
-
         if k == 0:
-            a = torch.where(
-                torch.logical_and(t[i] <= x, x < t[i + 1]), 1.0, 0.0
-            )
-            if i == len(t) - self.order - 1:
-                a = torch.where(x == t[-1], 1.0, a)
-            a.requires_grad_(True)
-            return a
+            # Base case: B-spline of order 0 is a step function
+            value = (x[..., None] >= knots[..., :-1]) & (x[..., None] < knots[..., 1:])
+            return value.to(x.dtype)
 
-        if t[i + k] == t[i]:
-            c1 = torch.tensor([0.0] * len(x), requires_grad=True)
-        else:
-            c1 = (x - t[i]) / (t[i + k] - t[i]) * self.basis(x, k - 1, i, t)
+        # Recursive step
+        # First term
+        basis_k_minus_1_first = self._create_basis(x, k - 1, knots)
+        
+        denom1 = knots[..., k:-1] - knots[..., :-(k+1)]
+        denom1 = torch.where(torch.abs(denom1) < 1e-8, torch.ones_like(denom1), denom1)
+        
+        numer1 = x[..., None] - knots[..., :-(k+1)]
+        term1 = (numer1 / denom1) * basis_k_minus_1_first
 
-        if t[i + k + 1] == t[i + 1]:
-            c2 = torch.tensor([0.0] * len(x), requires_grad=True)
-        else:
-            c2 = (
-                (t[i + k + 1] - x)
-                / (t[i + k + 1] - t[i + 1])
-                * self.basis(x, k - 1, i + 1, t)
-            )
+        # Second term
+        basis_k_minus_1_second = self._create_basis(x, k - 1, torch.roll(knots, shifts=-1, dims=-1))
+        
+        denom2 = knots[..., k+1:] - knots[..., 1:-k]
+        denom2 = torch.where(torch.abs(denom2) < 1e-8, torch.ones_like(denom2), denom2)
 
-        return c1 + c2
+        numer2 = knots[..., k+1:] - x[..., None]
+        term2 = (numer2 / denom2) * basis_k_minus_1_second
+
+        return term1 + term2
+
+
+    def compute_control_points(self, x_eval, y_eval, new_knots):
+        """
+        Compute control points from given evaluations using least squares with regularization.
+        """
+        print("--- spline.compute_control_points ---")
+        print(f"x_eval shape: {x_eval.shape}, range: [{x_eval.min():.4f}, {x_eval.max():.4f}]")
+        print(f"y_eval shape: {y_eval.shape}, range: [{y_eval.min():.4f}, {y_eval.max():.4f}]")
+        print(f"new_knots shape: {new_knots.shape}, range: [{new_knots.min():.4f}, {new_knots.max():.4f}]")
+        
+        A = self._create_basis(x_eval, self.k, new_knots)
+        print(f"Basis matrix A shape: {A.shape}")
+        
+        in_dim = A.shape[1]
+        out_dim = y_eval.shape[2]
+        n_basis = A.shape[2]
+        c = torch.zeros(in_dim, out_dim, n_basis).to(A.device)
+
+        for i in range(in_dim):
+            A_i = A[:, i, :]
+            y_i = y_eval[:, i, :]
+            
+            # Regularized least squares
+            A_t_A = A_i.T @ A_i
+            A_t_y = A_i.T @ y_i
+            ridge = 1e-6 * torch.eye(A_t_A.shape[0], device=A_i.device)
+            
+            try:
+                c_i = torch.linalg.solve(A_t_A + ridge, A_t_y).T
+                c[i, :, :] = c_i
+            except torch.linalg.LinAlgError as e:
+                print(f"ERROR: torch.linalg.solve failed for input_dim {i}: {e}")
+        
+        print(f"Computed control points shape: {c.shape}, range: [{c.min():.4f}, {c.max():.4f}]")
+        self.knots = new_knots
+        self.control_points = torch.nn.Parameter(c)
+        print("--- End spline.compute_control_points ---\n")
 
     @property
     def control_points(self):
@@ -131,9 +163,12 @@ class Spline(torch.nn.Module):
             dim = value.get("dim", 1)
             value = torch.zeros(n, dim)
 
+        if not isinstance(value, torch.nn.Parameter):
+            value = torch.nn.Parameter(value)
+            
         if not isinstance(value, torch.Tensor):
             raise ValueError("Invalid value for control_points")
-        self._control_points = torch.nn.Parameter(value, requires_grad=True)
+        self._control_points = value
 
     @property
     def knots(self):
@@ -180,7 +215,6 @@ class Spline(torch.nn.Module):
             raise ValueError("Invalid value for knots")
 
         self._knots = value
-
     def forward(self, x):
         """
         Forward pass for the :class:`Spline` model.
@@ -193,7 +227,22 @@ class Spline(torch.nn.Module):
         k = self.k
         c = self.control_points
 
-        basis = map(lambda i: self.basis(x, k, i, t)[:, None], range(len(c)))
-        y = (torch.cat(list(basis), dim=1) * c).sum(axis=1)
+        # Create the basis functions
+        # B will have shape (batch, in_dim, n_basis)
+        B = self._create_basis(x, k, t)
+
+        # KAN case where control points are (in_dim, out_dim, n_basis)
+        if c.ndim == 3:
+            y_ij = torch.einsum("bil,iol->bio", B, c)  # (batch, in_dim, out_dim)
+            # sum over input dimensions
+            y = torch.sum(y_ij, dim=1)  # (batch, out_dim)
+        # Original test case
+        else:
+            B = B.squeeze(1)  # (batch, n_basis)
+            if c.ndim == 1:
+                y = torch.einsum("bi,i->b", B, c)
+            else:
+                y = torch.einsum("bi,ij->bj", B, c)
 
         return y
+
