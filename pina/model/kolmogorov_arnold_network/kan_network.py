@@ -19,7 +19,7 @@ class KAN_Network(torch.nn.Module):
         layer_sizes: List[int],
         k: int = 3,
         num: int = 3,
-        grid_eps: float = 0.02,
+        grid_eps: float = 0.1,
         grid_range: List[float] = [-1, 1],
         grid_extension: bool = True,
         noise_scale: float = 0.1,

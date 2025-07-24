@@ -34,6 +34,9 @@ class Spline(torch.nn.Module):
         self.order = order
         self.k = order - 1
         self.grid_extension = grid_extension
+        
+        # Cache for performance optimization
+        self._boundary_interval_idx = None
 
         if knots is not None and control_points is not None:
             self.knots = knots
@@ -68,6 +71,35 @@ class Spline(torch.nn.Module):
 
         if self.knots.ndim > 2:
             raise ValueError("Knot vector must be one or two-dimensional.")
+            
+        # Precompute boundary interval index for performance
+        self._compute_boundary_interval()
+
+    def _compute_boundary_interval(self):
+        """
+        Precompute the rightmost non-degenerate interval index for performance.
+        This avoids the search loop in the basis function on every call.
+        """
+        if not isinstance(self.knots, torch.Tensor):
+            self._boundary_interval_idx = None
+            return
+            
+        # Find the rightmost interval with positive width
+        knots = self.knots
+        
+        # Handle multi-dimensional knots
+        if knots.ndim > 1:
+            # For multi-dimensional knots, we'll handle boundary detection in the basis function
+            self._boundary_interval_idx = None
+            return
+            
+        # For 1D knots, find the rightmost non-degenerate interval
+        for i in range(len(knots) - 2, -1, -1):
+            if knots[i] < knots[i + 1]:  # Non-degenerate interval found
+                self._boundary_interval_idx = i
+                return
+        
+        self._boundary_interval_idx = len(knots) - 2 if len(knots) > 1 else 0
 
     def basis(self, x, k, knots):
         """
@@ -80,23 +112,37 @@ class Spline(torch.nn.Module):
         :return: The basis functions evaluated at x
         :rtype: torch.Tensor
         """
-        # unsqueeze for broadcasting
+
         if x.ndim == 1:
             x = x.unsqueeze(1)  # (batch_size, 1)
-        x = x.unsqueeze(2)  # (batch_size, in_dim, 1)
+        if x.ndim == 2:
+            x = x.unsqueeze(2)  # (batch_size, in_dim, 1)
 
         if knots.ndim == 1:
             knots = knots.unsqueeze(0)  # (1, n_knots)
-        knots = knots.unsqueeze(0)  # (1, in_dim, n_knots)
+        if knots.ndim == 2:
+            knots = knots.unsqueeze(0)  # (1, in_dim, n_knots)
 
         # Base case: k=0
         basis = (x >= knots[..., :-1]) & (x < knots[..., 1:])
         basis = basis.to(x.dtype)
-        basis[..., -1] = (x.squeeze(-1) >= knots[..., -2]) & (
-            x.squeeze(-1) <= knots[..., -1]
-        )
+        
 
-        # Iterative step
+        if self._boundary_interval_idx is not None:
+            i = self._boundary_interval_idx
+            tolerance = 1e-10  
+            x_squeezed = x.squeeze(-1)
+            knot_left = knots[..., i]
+            knot_right = knots[..., i + 1]
+            
+            at_right_boundary = torch.abs(x_squeezed - knot_right) <= tolerance
+            in_rightmost_interval = (x_squeezed >= knot_left) & at_right_boundary
+            
+            if torch.any(in_rightmost_interval):
+                # For points at the boundary, ensure they're included in the rightmost interval
+                basis[..., i] = torch.logical_or(basis[..., i].bool(), in_rightmost_interval).to(basis.dtype)
+
+        # Iterative step (Cox-de Boor recursion)
         for i in range(1, k + 1):
             # First term of the recursion
             denom1 = knots[..., i:-1] - knots[..., : -(i + 1)]
@@ -219,6 +265,10 @@ class Spline(torch.nn.Module):
             raise ValueError("Invalid value for knots")
 
         self._knots = value
+        
+        # Recompute boundary interval when knots change
+        if hasattr(self, '_boundary_interval_idx'):
+            self._compute_boundary_interval()
 
     def forward(self, x):
         """
